@@ -1,335 +1,615 @@
--- ===================================================
--- DANIELROBLOX.STORE - FLUENT UI (ANTI ERROR 773 + DISCORD WEBHOOK)
--- ===================================================
+-- =====================================================================
+-- 💎 HUYNH TOANN HUB | HAZE SEAS PROJECT V2.11.1
+-- Update: Fix bug Server Hop cũ, Fix lụm chuỗi liên tục, Chống kẹt Tween
+-- =====================================================================
 
+local CoreGui = game:GetService("CoreGui")
 local Players = game:GetService("Players")
-local RS = game:GetService("ReplicatedStorage")
-local TeleportService = game:GetService("TeleportService")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
-local LocalPlayer = Players.LocalPlayer
+local TeleportService = game:GetService("TeleportService")
 
-local Networking = require(RS:WaitForChild("SharedModules"):WaitForChild("Networking"))
-local PetModules = require(RS:WaitForChild("SharedModules"):WaitForChild("PetModules"))
+local Player = Players.LocalPlayer
 
-local Fluent = loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"))()
-
-local Window = Fluent:CreateWindow({
-    Title = "DanielRoblox.Store",
-    SubTitle = "Auto Pet & Webhook",
-    TabWidth = 160,
-    Size = UDim2.fromOffset(500, 480),
-    Theme = "Darker"
-})
-
-local Tabs = { Pets = Window:AddTab({ Title = "Catch Pets", Icon = "paw" }) }
-
--- Quét Pet
-local DynamicPetList = {"All"}
-for petName, _ in pairs(PetModules) do
-    if type(petName) == "string" then table.insert(DynamicPetList, petName) end
-end
-table.sort(DynamicPetList, function(a, b) return a == "All" or (b ~= "All" and a < b) end)
-
-local RankList = {"All", "Common", "Uncommon", "Rare", "Super", "Epic", "Legendary", "Mythic"}
-
-local ConfigFileName = "DanielRobloxStoreConfig.json"
-local Config = {
-    AutoTameTeleport = false,
-    AutoServerHop = false,
-    AutoExecute = false,
-    UseWebhook = false,
-    WebhookURL = "",
-    TargetPet = "All",
-    TargetRank = "All"
+-- ==========================================
+-- 1. TRẠNG THÁI HỆ THỐNG
+-- ==========================================
+local HubState = {
+    Toggles = {
+        AutoFarm = true,  
+        AutoSell = true,
+        EspFruit = false,
+        AntiWater = false,
+        AutoHop = true    
+    },
+    Settings = {
+        FlySpeed = 280,
+        HopDelay = 15,
+        MinPlayersHop = 9  -- Chỉ hop vào server >= 9 người (tối đa 12)
+    },
+    Connections = {}, 
+    Objects = { CurrentTween = nil }
 }
 
--- Hệ thống lưu cấu hình
-local function canSaveConfig() return type(writefile) == "function" end
-local function saveConfig()
-    if canSaveConfig() then pcall(writefile, ConfigFileName, HttpService:JSONEncode(Config)) end
-end
-if canSaveConfig() and isfile(ConfigFileName) then
-    pcall(function()
-        local decoded = HttpService:JSONDecode(readfile(ConfigFileName))
-        for k, v in pairs(decoded) do if Config[k] ~= nil then Config[k] = v end end
-    end)
+-- ==========================================
+-- MODULE HỖ TRỢ: SERVER HOP KHÔN NGOAN (ĐÃ FIX)
+-- ==========================================
+-- FIX 1: Lưu danh sách server đã visit để không hop lại
+local VisitedServers = { [game.JobId] = true }
+
+local function ServerHop()
+    local placeId = game.PlaceId
+    -- sortOrder=Desc: ưu tiên server đông người (thường có fruit hơn)
+    local url = "https://games.roblox.com/v1/games/" .. placeId .. "/servers/Public?sortOrder=Desc&excludeFullGames=true&limit=100"
+    
+    local success, result = pcall(function() return game:HttpGet(url) end)
+
+    if not success then
+        warn("[HazeHub] Lỗi HTTP khi lấy danh sách server: " .. tostring(result))
+        return false
+    end
+
+    local decodeOk, data = pcall(function() return HttpService:JSONDecode(result) end)
+    if not decodeOk or not data or not data.data then
+        warn("[HazeHub] Lỗi decode JSON server list")
+        return false
+    end
+
+    for _, server in ipairs(data.data) do
+        -- Kiểm tra: đủ người + chưa đầy + chưa visit + không phải server hiện tại
+        if server.playing and server.maxPlayers 
+            and server.playing >= HubState.Settings.MinPlayersHop  -- Bỏ qua server ít người
+            and server.playing < server.maxPlayers - 1 
+            and server.id ~= game.JobId 
+            and not VisitedServers[server.id] then
+            
+            -- Đánh dấu server này là đã visit
+            VisitedServers[server.id] = true
+            
+            -- FIX 5: Wrap teleport trong pcall để bắt lỗi
+            local teleportOk, teleportErr = pcall(function()
+                TeleportService:TeleportToPlaceInstance(placeId, server.id, Player)
+            end)
+            
+            if teleportOk then
+                -- FIX 6: RETURN ngay sau khi teleport thành công, không chạy tiếp loop
+                return true
+            else
+                warn("[HazeHub] Teleport thất bại tới server " .. server.id .. ": " .. tostring(teleportErr))
+                -- Tiếp tục thử server khác
+            end
+        end
+    end
+
+    -- FIX 7: Nếu đã hết server mới → reset danh sách visited để thử lại
+    warn("[HazeHub] Đã hết server mới, reset danh sách visited...")
+    VisitedServers = { [game.JobId] = true }
+    return false
 end
 
-local function enableAutoExecuteAfterDelay()
+-- ==========================================
+-- 2. MODULE: SERVER RADAR (TÍCH HỢP AUTO HOP - ĐÃ FIX)
+-- ==========================================
+local function StartRadar(statusLabel)
+    local noFruitTimer = 0 
+
     task.spawn(function()
-        task.wait(3)
-        if Config.AutoExecute then
-            Config.AutoTameTeleport = true
-            saveConfig()
-        end
-    end)
-end
-if Config.AutoExecute then enableAutoExecuteAfterDelay() end
+        while task.wait(1) do
+            local success, err = pcall(function()
+                local fruitCount = 0
+                local fruitNames = {}
 
--- ===================================================
--- HỆ THỐNG GỬI DISCORD WEBHOOK
--- ===================================================
-local request_func = (syn and syn.request) or (http and http.request) or http_request or (fluxus and fluxus.request) or request
-local function SendWebhook(petName, petRank)
-    if not Config.UseWebhook or Config.WebhookURL == "" or not request_func then return end
-    
-    local embedData = {
-        ["title"] = "🎉 BẮT THÀNH CÔNG THÚ CƯNG!",
-        ["color"] = 65280, -- Màu xanh lá
-        ["fields"] = {
-            {["name"] = "🐾 Tên Pet:", ["value"] = tostring(petName), ["inline"] = true},
-            {["name"] = "⭐ Độ Hiếm (Rank):", ["value"] = tostring(petRank), ["inline"] = true},
-            {["name"] = "👤 Tài Khoản:", ["value"] = "||" .. LocalPlayer.Name .. "||", ["inline"] = false}
-        },
-        ["footer"] = {["text"] = "DanielRoblox.Store | Auto Logger"}
-    }
-    
-    local payload = HttpService:JSONEncode({
-        ["username"] = "Daniel Store",
-        ["avatar_url"] = "https://i.imgur.com/8QG4sS4.png", -- Bạn có thể thay link logo của store vào đây
-        ["embeds"] = {embedData}
-    })
-    
-    task.spawn(function()
-        pcall(function()
-            request_func({
-                Url = Config.WebhookURL,
-                Method = "POST",
-                Headers = {["Content-Type"] = "application/json"},
-                Body = payload
-            })
-        end)
-    end)
-end
+                local logic = Workspace:FindFirstChild("Logic")
+                if not logic then
+                    statusLabel.Text = "Lỗi: Không tìm thấy thư mục Logic"
+                    statusLabel.TextColor3 = Color3.fromRGB(255, 255, 0)
+                    return
+                end
 
--- ===================================================
--- CUSTOM HOP FIX LỖI 773
--- ===================================================
-local recentServerIds = {}
+                local function ProcessForRadar(obj)
+                    if not obj or obj:IsA("Folder") then return end
+                    local prompt = obj:FindFirstChildWhichIsA("ProximityPrompt", true)
+                    if prompt then
+                        fruitCount = fruitCount + 1
+                        local cleanName = obj.Name:gsub("Fruit", ""):gsub("_Model", ""):gsub("Drop", "")
+                        table.insert(fruitNames, cleanName)
+                    end
+                end
 
-local function FetchServerPages(placeId, maxPages)
-    local servers = {}
-    local cursor = nil
-    for page = 1, maxPages or 5 do
-        local url = "https://games.roblox.com/v1/games/" .. placeId .. "/servers/Public?sortOrder=Asc&limit=100"
-        if cursor then
-            url = url .. "&cursor=" .. HttpService:UrlEncode(cursor)
-        end
+                local function Scan(folderName)
+                    local folder = logic:FindFirstChild(folderName)
+                    if not folder then return end
+                    for _, item in pairs(folder:GetChildren()) do
+                        if item:IsA("Folder") then
+                            for _, subItem in pairs(item:GetChildren()) do ProcessForRadar(subItem) end
+                        else ProcessForRadar(item) end
+                    end
+                end
 
-        local success, result = pcall(function()
-            return HttpService:JSONDecode(game:HttpGet(url))
-        end)
-        if not success or not result or not result.data then
-            break
-        end
+                Scan("FruitDrops")
+                Scan("FruitSpawns")
 
-        for _, server in ipairs(result.data) do
-            if type(server) == "table" then
-                table.insert(servers, server)
-            end
-        end
+                if fruitCount > 0 then
+                    noFruitTimer = 0 
+                    local displayNames = {}
+                    for i = 1, math.min(fruitCount, 2) do table.insert(displayNames, fruitNames[i]) end
+                    local suffix = fruitCount > 2 and "..." or ""
+                    
+                    statusLabel.Text = "Map có: " .. fruitCount .. " trái (" .. table.concat(displayNames, ", ") .. suffix .. ")"
+                    statusLabel.TextColor3 = Color3.fromRGB(85, 255, 127)
+                else
+                    if HubState.Toggles.AutoHop then
+                        noFruitTimer = noFruitTimer + 1
+                        local remaining = HubState.Settings.HopDelay - noFruitTimer
+                        statusLabel.Text = "Hết hàng! Hop Server trong: " .. remaining .. "s"
+                        statusLabel.TextColor3 = Color3.fromRGB(255, 170, 0)
 
-        if not result.nextPageCursor then
-            break
-        end
-        cursor = result.nextPageCursor
-    end
-    return servers
-end
-
-local function CustomServerHop()
-    Fluent:Notify({Title = "Hopping...", Content = "Finding a different server", Duration = 3})
-    local success, result = pcall(function()
-        return HttpService:JSONDecode(game:HttpGet("https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=Asc&limit=100"))
-    end)
-    if success and result and result.data then
-        local validServers = {}
-        for _, server in ipairs(result.data) do
-            if server.id ~= game.JobId and not recentServerIds[server.id] then
-                table.insert(validServers, server.id)
-            end
-        end
-        if #validServers > 0 then
-            local randomServer = validServers[math.random(1, #validServers)]
-            recentServerIds[randomServer] = true
-            local count = 0
-            for _ in pairs(recentServerIds) do count = count + 1 end
-            if count > 5 then recentServerIds = {} end
-            TeleportService:TeleportToPlaceInstance(game.PlaceId, randomServer, LocalPlayer)
-        else
-            Fluent:Notify({Title = "Error", Content = "No available servers found", Duration = 3})
-        end
-    end
-end
-
-local function findIndex(list, value)
-    for index, item in ipairs(list) do if item == value then return index end end
-    return 1
-end
-
--- ===================================================
--- UI MENU
--- ===================================================
-local PetDropdown = Tabs.Pets:AddDropdown("PetDropdown", { Title = "Choose Pet", Values = DynamicPetList, Multi = false, Default = findIndex(DynamicPetList, Config.TargetPet) })
-PetDropdown:OnChanged(function(Value) Config.TargetPet = Value; saveConfig() end)
-
-local RankDropdown = Tabs.Pets:AddDropdown("RankDropdown", { Title = "Choose Rank", Values = RankList, Multi = false, Default = findIndex(RankList, Config.TargetRank) })
-RankDropdown:OnChanged(function(Value) Config.TargetRank = Value; saveConfig() end)
-
-Tabs.Pets:AddButton({
-    Title = "Refresh Pets",
-    Callback = function()
-        local newList = {"All"}
-        for pName, _ in pairs(require(RS:WaitForChild("SharedModules"):WaitForChild("PetModules"))) do table.insert(newList, pName) end
-        table.sort(newList, function(a, b) return a == "All" or (b ~= "All" and a < b) end)
-        PetDropdown:SetValues(newList)
-        Fluent:Notify({Title = "Refreshed", Content = "Pet list updated.", Duration = 3})
-    end
-})
-
-local WebhookInput = Tabs.Pets:AddInput("WebhookInput", {
-    Title = "Discord Webhook URL",
-    Default = Config.WebhookURL,
-    Placeholder = "https://discord.com/api/webhooks/...",
-    Numeric = false,
-    Finished = false,
-    Callback = function(Value)
-        Config.WebhookURL = Value
-        saveConfig()
-    end
-})
-
-local WebhookToggle = Tabs.Pets:AddToggle("WebhookToggle", { Title = "Enable Webhook Logger", Default = Config.UseWebhook })
-WebhookToggle:OnChanged(function(Value) Config.UseWebhook = Value; saveConfig() end)
-
-local AutoExecToggle = Tabs.Pets:AddToggle("AutoExecToggle", { Title = "Auto execute (Save State)", Default = Config.AutoExecute })
-AutoExecToggle:OnChanged(function(Value) Config.AutoExecute = Value; if Value then enableAutoExecuteAfterDelay() end; saveConfig() end)
-
-local TameToggle = Tabs.Pets:AddToggle("TameToggle", { Title = "Auto catch pet", Default = Config.AutoTameTeleport })
-TameToggle:OnChanged(function(Value) Config.AutoTameTeleport = Value; saveConfig() end)
-
-local HopToggle = Tabs.Pets:AddToggle("HopToggle", { Title = "Auto server hop", Default = Config.AutoServerHop })
-HopToggle:OnChanged(function(Value) Config.AutoServerHop = Value; saveConfig() end)
-
-local function setToggleState(toggle, value)
-    if not toggle then return end
-    if type(toggle.Set) == "function" then
-        pcall(toggle.Set, toggle, value)
-    elseif type(toggle.SetValue) == "function" then
-        pcall(toggle.SetValue, toggle, value)
-    elseif type(toggle.SetState) == "function" then
-        pcall(toggle.SetState, toggle, value)
-    end
-end
-
-local ServerTab = Window:AddTab({ Title = "Server Control", Icon = "server" })
-
-ServerTab:AddSection("Server Control")
-ServerTab:AddButton({ Title = "📋 Copy Server ID", Callback = function() setclipboard(game.JobId) Fluent:Notify({Title="Copied", Content="Server ID Copied!"}) end })
-ServerTab:AddButton({ Title = "🔄 Rejoin Server", Callback = function() TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId) end })
-ServerTab:AddButton({ Title = "🔀 Server Hop", Callback = function()
-    Fluent:Notify({Title = "Hopping...", Content = "Finding a different server", Duration = 3})
-    local success, result = pcall(function() return HttpService:JSONDecode(game:HttpGet("https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=Asc&limit=100")) end)
-    if success and result and result.data then
-        local validServers = {}
-        for _, server in ipairs(result.data) do
-            if server.id ~= game.JobId and not recentServerIds[server.id] then table.insert(validServers, server.id) end
-        end
-        if #validServers > 0 then
-            local randomServer = validServers[math.random(1, #validServers)]
-            recentServerIds[randomServer] = true
-            local count = 0
-            for _ in pairs(recentServerIds) do count = count + 1 end
-            if count > 5 then recentServerIds = {} end
-            TeleportService:TeleportToPlaceInstance(game.PlaceId, randomServer)
-        else
-            Fluent:Notify({Title = "Error", Content = "No available servers found", Duration = 3})
-        end
-    end
-end })
-ServerTab:AddInput("JoinServerInput", { Title = "Join Server by ID", Placeholder = "Enter JobId here...", Callback = function(JobId) if JobId and #JobId > 0 then TeleportService:TeleportToPlaceInstance(game.PlaceId, JobId) end end })
-ServerTab:AddButton({ Title = "👥 Join Low Server", Callback = function()
-    Fluent:Notify({Title = "Searching...", Content = "Finding a quiet server", Duration = 4})
-    local currentJobId = tostring(game.JobId)
-    local servers = FetchServerPages(game.PlaceId, 5)
-    local chosenServer = nil
-    for _, server in ipairs(servers) do
-        if type(server) == "table" and server.id and server.playing and tostring(server.id) ~= currentJobId and server.playing < 8 then
-            local serverId = tostring(server.id)
-            if not recentServerIds[serverId] then
-                chosenServer = serverId
-                break
-            end
-        end
-    end
-    if not chosenServer then
-        for _, server in ipairs(servers) do
-            if type(server) == "table" and server.id and server.playing and tostring(server.id) ~= currentJobId and server.playing < 8 then
-                chosenServer = tostring(server.id)
-                break
-            end
-        end
-    end
-    if chosenServer then
-        recentServerIds[chosenServer] = true
-        TeleportService:TeleportToPlaceInstance(game.PlaceId, chosenServer)
-    else
-        Fluent:Notify({Title = "Info", Content = "No quiet servers found", Duration = 3})
-    end
-end })
-
--- ===================================================
--- VÒNG LẶP SĂN PET
--- ===================================================
-task.spawn(function()
-    while task.wait(1) do 
-        if Config.AutoTameTeleport then
-            pcall(function()
-                local char = LocalPlayer.Character
-                local hrp = char and char:FindFirstChild("HumanoidRootPart")
-                local wildPetRef = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("WildPetRef")
-                if not hrp or not wildPetRef then return end
-                
-                local hasMatchingPet = false 
-                
-                for _, petPart in pairs(wildPetRef:GetChildren()) do
-                    if petPart:IsA("BasePart") then
-                        local owner = petPart:GetAttribute("OwnerUserId")
-                        local petName = petPart:GetAttribute("PetName") or ""
-                        local petRarity = petPart:GetAttribute("Rarity") or "Common"
-                        if petRarity == "" then petRarity = "Common" end
-                        
-                        if not owner or owner == 0 then
-                            local matchPet = (Config.TargetPet == "All" or petName == Config.TargetPet)
-                            local matchRank = (Config.TargetRank == "All" or petRarity == Config.TargetRank)
+                        if noFruitTimer >= HubState.Settings.HopDelay then
+                            statusLabel.Text = "Đang chuyển Server..."
+                            statusLabel.TextColor3 = Color3.fromRGB(255, 60, 60)
                             
-                            if matchPet and matchRank then
-                                hasMatchingPet = true 
-                                hrp.CFrame = petPart.CFrame * CFrame.new(0, 3, 0)
-                                task.wait(0.4) 
-                                Networking.Pets.WildPetTame:Fire(petPart)
-
-                                -- GỌI WEBHOOK BÁO KẾT QUẢ VỀ DISCORD!
-                                SendWebhook(petName, petRarity)
-                                
-                                Config.AutoServerHop = false
-                                saveConfig()
-                                setToggleState(HopToggle, false)
-                                
-                                task.wait(0.6)
+                            local hopResult = ServerHop()
+                            
+                            -- FIX 8: Nếu hop thất bại, reset timer và hiển thị lỗi
+                            if not hopResult then
+                                noFruitTimer = 0
+                                statusLabel.Text = "Hop thất bại! Thử lại sau " .. HubState.Settings.HopDelay .. "s"
+                                statusLabel.TextColor3 = Color3.fromRGB(255, 80, 80)
                             end
+                            
+                            task.wait(10) 
                         end
+                    else
+                        statusLabel.Text = "Trạng thái: Sạch bóng (Đang chờ)"
+                        statusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+                    end
+                end
+            end)
+
+            if not success then
+                statusLabel.Text = "Đang kết nối lại Radar..."
+                statusLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
+            end
+        end
+    end)
+end
+
+-- ==========================================
+-- 3. MODULE: ESP FRUIT
+-- ==========================================
+local function ApplyESP(fruitObj)
+    if not HubState.Toggles.EspFruit then return end
+    if not (fruitObj:IsA("Model") or fruitObj:IsA("BasePart")) then return end
+    if fruitObj:FindFirstChild("Toann_ESP_HL") then return end 
+    
+    local prompt = fruitObj:FindFirstChildWhichIsA("ProximityPrompt", true)
+    if not prompt then return end
+    local targetPart = fruitObj:IsA("Model") and (fruitObj.PrimaryPart or fruitObj:FindFirstChildWhichIsA("BasePart", true)) or fruitObj
+
+    local hl = Instance.new("Highlight", fruitObj)
+    hl.Name = "Toann_ESP_HL"; hl.FillColor = Color3.fromRGB(255, 0, 255); hl.OutlineColor = Color3.fromRGB(255, 255, 255); hl.FillTransparency = 0.5; hl.Adornee = fruitObj
+
+    if targetPart then
+        local bg = Instance.new("BillboardGui", fruitObj)
+        bg.Name = "Toann_ESP_BG"; bg.Size = UDim2.new(0, 150, 0, 30); bg.AlwaysOnTop = true; bg.Adornee = targetPart
+        local txt = Instance.new("TextLabel", bg)
+        txt.Size = UDim2.new(1, 0, 1, 0); txt.BackgroundTransparency = 1; txt.Text = "🍎 " .. fruitObj.Name; txt.TextColor3 = Color3.fromRGB(255, 255, 0); txt.Font = Enum.Font.GothamBold; txt.TextSize = 12
+    end
+end
+
+local function ToggleESP(state)
+    if not state then
+        if HubState.Connections.EspDrops then HubState.Connections.EspDrops:Disconnect() end
+        if HubState.Connections.EspSpawns then HubState.Connections.EspSpawns:Disconnect() end
+        for _, obj in pairs(Workspace:GetDescendants()) do
+            if obj.Name == "Toann_ESP_HL" or obj.Name == "Toann_ESP_BG" then obj:Destroy() end
+        end
+        return
+    end
+
+    local logic = Workspace:FindFirstChild("Logic")
+    if not logic then return end
+
+    local function ScanForESP(folderName)
+        local folder = logic:FindFirstChild(folderName)
+        if not folder then return end
+        for _, item in pairs(folder:GetChildren()) do
+            if item:IsA("Folder") then
+                for _, subItem in pairs(item:GetChildren()) do ApplyESP(subItem) end
+            else ApplyESP(item) end
+        end
+    end
+
+    ScanForESP("FruitSpawns")
+    ScanForESP("FruitDrops")
+
+    local spawns = logic:FindFirstChild("FruitSpawns")
+    local drops = logic:FindFirstChild("FruitDrops")
+
+    if spawns then HubState.Connections.EspSpawns = spawns.DescendantAdded:Connect(function(c) task.wait(0.5) ApplyESP(c) end) end
+    if drops then HubState.Connections.EspDrops = drops.DescendantAdded:Connect(function(c) task.wait(0.5) ApplyESP(c) end) end
+end
+
+-- ==========================================
+-- 4. MODULE: AUTO GOM FRUIT (ĐÃ VIẾT LẠI HOÀN TOÀN)
+-- ==========================================
+-- Hàm tìm trái gần nhất
+local function GetClosestFruit()
+    local char = Player.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return nil, nil end
+
+    local logic = Workspace:FindFirstChild("Logic")
+    if not logic then return nil, nil end
+
+    local closestFruit = nil
+    local closestPrompt = nil
+    local shortestDist = math.huge
+
+    local function CheckFolder(folderName)
+        local folder = logic:FindFirstChild(folderName)
+        if not folder then return end
+        for _, item in pairs(folder:GetDescendants()) do
+            if item:IsA("Model") or item:IsA("BasePart") then
+                local prompt = item:FindFirstChildWhichIsA("ProximityPrompt", true)
+                if prompt then
+                    local targetCFrame = item:IsA("Model") and item:GetPivot() or item.CFrame
+                    local dist = (root.Position - targetCFrame.Position).Magnitude
+                    if dist < shortestDist then
+                        shortestDist = dist
+                        closestFruit = item
+                        closestPrompt = prompt
+                    end
+                end
+            end
+        end
+    end
+
+    CheckFolder("FruitSpawns")
+    CheckFolder("FruitDrops")
+
+    return closestFruit, closestPrompt
+end
+
+-- ==========================================
+-- HỆ THỐNG BAY 3 PHA: LÊN CAO → BAY NGANG → HẠ XUỐNG
+-- ==========================================
+local FLY_HEIGHT = 180 -- Độ cao bay (đủ cao để tránh địa hình + nước)
+
+-- Hàm setup anti-gravity + noclip (dùng chung cho cả 3 pha)
+local function SetupFlight(rootPart)
+    local char = rootPart.Parent
+    if not char then return nil, nil, nil end
+    
+    -- Xóa BodyVelocity cũ nếu còn sót
+    local oldBV = rootPart:FindFirstChild("Toann_FlyBV")
+    if oldBV then oldBV:Destroy() end
+    
+    -- 1. BodyVelocity triệt tiêu trọng lực
+    local bv = Instance.new("BodyVelocity")
+    bv.Name = "Toann_FlyBV"
+    bv.Velocity = Vector3.new(0, 0, 0)
+    bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+    bv.Parent = rootPart
+    
+    -- 2. Noclip liên tục mỗi frame
+    local noclipConn = RunService.Stepped:Connect(function()
+        if not char or not char.Parent then return end
+        for _, part in pairs(char:GetDescendants()) do
+            if part:IsA("BasePart") then
+                part.CanCollide = false
+            end
+        end
+    end)
+    
+    return bv, noclipConn, char
+end
+
+-- Hàm cleanup sau khi bay xong
+local function CleanupFlight(bv, noclipConn)
+    if noclipConn then pcall(function() noclipConn:Disconnect() end) end
+    if bv and bv.Parent then bv:Destroy() end
+end
+
+-- Hàm bay 1 đoạn (dùng cho mỗi pha)
+local function FlySegment(rootPart, fromPos, toPos, speed, bv)
+    local distance = (fromPos - toPos).Magnitude
+    if distance < 1 then return true end -- Đã ở vị trí rồi
+    
+    local duration = distance / speed
+    local startTime = tick()
+    local arrived = false
+    
+    local flyConn
+    flyConn = RunService.Heartbeat:Connect(function()
+        if not rootPart or not rootPart.Parent then
+            flyConn:Disconnect()
+            arrived = true
+            return
+        end
+        
+        local elapsed = tick() - startTime
+        local alpha = math.clamp(elapsed / math.max(duration, 0.01), 0, 1)
+        local newPos = fromPos:Lerp(toPos, alpha)
+        
+        rootPart.CFrame = CFrame.new(newPos) * rootPart.CFrame.Rotation
+        bv.Velocity = Vector3.new(0, 0, 0)
+        
+        if alpha >= 1 then
+            flyConn:Disconnect()
+            arrived = true
+        end
+    end)
+    
+    -- Chờ bay xong (timeout chống treo)
+    local waitTimeout = 0
+    while not arrived and waitTimeout < (duration + 5) do
+        task.wait(0.1)
+        waitTimeout = waitTimeout + 0.1
+    end
+    
+    if flyConn then pcall(function() flyConn:Disconnect() end) end
+    return arrived
+end
+
+-- Hàm bay chính: 3 pha (LÊN → NGANG → XUỐNG)
+-- Trả về bv, noclipConn để giữ anti-gravity khi lụm trái
+local function FlyToFruit(rootPart, targetPos, speed)
+    local bv, noclipConn, char = SetupFlight(rootPart)
+    if not bv then return false, nil, nil end
+    
+    local startPos = rootPart.Position
+    
+    -- Tính độ cao bay: lấy max giữa vị trí hiện tại, vị trí trái, và FLY_HEIGHT
+    local safeY = math.max(startPos.Y, targetPos.Y, FLY_HEIGHT)
+    
+    -- ═══ PHA 1: BAY LÊN CAO ═══
+    local upPos = Vector3.new(startPos.X, safeY, startPos.Z)
+    local upSpeed = speed * 1.2 -- Bay lên nhanh hơn 1 chút
+    
+    if not FlySegment(rootPart, startPos, upPos, upSpeed, bv) then
+        CleanupFlight(bv, noclipConn)
+        return false, nil, nil
+    end
+    
+    -- Kiểm tra character còn sống
+    if not rootPart or not rootPart.Parent then
+        CleanupFlight(bv, noclipConn)
+        return false, nil, nil
+    end
+    
+    -- ═══ PHA 2: BAY NGANG TỚI TRÊN ĐẦU TRÁI ═══
+    local abovePos = Vector3.new(targetPos.X, safeY, targetPos.Z)
+    
+    if not FlySegment(rootPart, upPos, abovePos, speed, bv) then
+        CleanupFlight(bv, noclipConn)
+        return false, nil, nil
+    end
+    
+    if not rootPart or not rootPart.Parent then
+        CleanupFlight(bv, noclipConn)
+        return false, nil, nil
+    end
+    
+    -- ═══ PHA 3: HẠ XUỐNG TRÁI ═══
+    local downSpeed = speed * 0.8 -- Hạ xuống chậm hơn để không miss
+    
+    if not FlySegment(rootPart, abovePos, targetPos, downSpeed, bv) then
+        CleanupFlight(bv, noclipConn)
+        return false, nil, nil
+    end
+    
+    -- KHÔNG cleanup ở đây! Trả về bv + noclipConn để giữ float khi lụm
+    return true, bv, noclipConn
+end
+
+local function ToggleAutoFarm(state)
+    if not state then
+        -- Cleanup khi tắt
+        local char = Player.Character
+        if char then
+            local root = char:FindFirstChild("HumanoidRootPart")
+            if root then
+                local bv = root:FindFirstChild("Toann_FlyBV")
+                if bv then bv:Destroy() end
+            end
+        end
+        return
+    end
+
+    task.spawn(function()
+        while HubState.Toggles.AutoFarm do
+            local targetFruit, targetPrompt = GetClosestFruit()
+            
+            if targetFruit and targetPrompt then
+                local char = Player.Character
+                local rootPart = char and char:FindFirstChild("HumanoidRootPart")
+                
+                if rootPart then
+                    local targetCFrame = targetFruit:IsA("Model") and targetFruit:GetPivot() or targetFruit.CFrame
+                    local targetPos = targetCFrame.Position
+                    
+                    -- Bay 3 pha: LÊN CAO → NGANG → XUỐNG (giữ float)
+                    local flyOk, flyBV, flyNoclip = FlyToFruit(rootPart, targetPos, HubState.Settings.FlySpeed)
+
+                    if HubState.Toggles.AutoFarm and rootPart and rootPart.Parent then
+                        -- Ép dịch chuyển thẳng nếu vẫn còn lệch
+                        if (rootPart.Position - targetPos).Magnitude > 5 then
+                            rootPart.CFrame = CFrame.new(targetPos) * rootPart.CFrame.Rotation
+                            task.wait(0.1)
+                        end
+
+                        -- Spam fireproximityprompt cho đến khi trái biến mất
+                        -- Vẫn giữ BodyVelocity + noclip nên không bị rơi
+                        local timeout = 0
+                        while targetFruit.Parent and targetPrompt.Parent and HubState.Toggles.AutoFarm and timeout < 15 do
+                            pcall(function() fireproximityprompt(targetPrompt) end)
+                            task.wait(0.2)
+                            timeout = timeout + 1
+                        end
+                    end
+                    
+                    -- Lụm xong hoặc timeout → cleanup flight
+                    CleanupFlight(flyBV, flyNoclip)
+                end
+            else
+                task.wait(1) -- Nếu không có trái nào, chờ 1s rồi quét lại
+            end
+        end
+    end)
+end
+
+-- ==========================================
+-- 5. MODULE: AUTO SELL GEMS (CẦM Ô SỐ 4 - GIỮ NGUYÊN)
+-- ==========================================
+local function ToggleAutoSell(state)
+    if not state then return end
+    task.spawn(function()
+        while HubState.Toggles.AutoSell do
+            task.wait(1.5) 
+            local char = Player.Character
+            local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+            
+            if char and humanoid then
+                local backpackTools = {}
+                for _, obj in ipairs(Player.Backpack:GetChildren()) do
+                    if obj:IsA("Tool") then
+                        table.insert(backpackTools, obj)
                     end
                 end
                 
-                if not hasMatchingPet and Config.AutoServerHop then
-                    Fluent:Notify({ Title = "Server Hop", Content = "No matching pet. Bypassing Error 773 & Hopping...", Duration = 4 })
-                    CustomServerHop()
-                    task.wait(12) 
+                local toolSlot4 = backpackTools[4]
+                
+                if toolSlot4 then
+                    pcall(function()
+                        humanoid:EquipTool(toolSlot4)
+                        task.wait(0.5) 
+                        
+                        local Event = ReplicatedStorage:WaitForChild("Replication"):WaitForChild("ClientEvents"):WaitForChild("SellFruit")
+                        Event:InvokeServer("Sell for GEMS")
+                    end)
+                else
+                    for _, obj in ipairs(char:GetChildren()) do
+                        if obj:IsA("Tool") and (obj.Name:match("Fruit") or obj.Name:match("Mi")) then
+                            pcall(function()
+                                local Event = ReplicatedStorage:WaitForChild("Replication"):WaitForChild("ClientEvents"):WaitForChild("SellFruit")
+                                Event:InvokeServer("Sell for GEMS")
+                            end)
+                        end
+                    end
                 end
-            end)
+            end
         end
-    end
-end)
+    end)
+end
 
-Fluent:Notify({ Title = "DanielRoblox.Store", Content = "Webhook & Anti-773 Ready!", Duration = 5 })
+-- ==========================================
+-- 6. GIAO DIỆN PREMIUM DÀNH CHO AUTOEXEC
+-- ==========================================
+local function BuildPremiumUI()
+    if CoreGui:FindFirstChild("HuynhToann_V2") then CoreGui.HuynhToann_V2:Destroy() end
+
+    local ScreenGui = Instance.new("ScreenGui", CoreGui)
+    ScreenGui.Name = "HuynhToann_V2"
+
+    local Main = Instance.new("Frame", ScreenGui)
+    Main.Size = UDim2.new(0, 240, 0, 350) 
+    Main.Position = UDim2.new(0.5, -120, 0.2, 0)
+    Main.BackgroundColor3 = Color3.fromRGB(20, 20, 25) 
+    Main.Active = true; Main.Draggable = true
+    Instance.new("UICorner", Main).CornerRadius = UDim.new(0, 10)
+    
+    local MainStroke = Instance.new("UIStroke", Main)
+    MainStroke.Color = Color3.fromRGB(0, 170, 255)
+    MainStroke.Thickness = 1.5
+
+    local Title = Instance.new("TextLabel", Main)
+    Title.Size = UDim2.new(1, 0, 0, 40)
+    Title.BackgroundTransparency = 1
+    Title.Text = "HAZE SEAS PRO"
+    Title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    Title.Font = Enum.Font.GothamBlack
+    Title.TextSize = 16
+
+    local Line = Instance.new("Frame", Main)
+    Line.Size = UDim2.new(0.9, 0, 0, 1)
+    Line.Position = UDim2.new(0.05, 0, 0, 40)
+    Line.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
+    Line.BorderSizePixel = 0
+
+    local RadarFrame = Instance.new("Frame", Main)
+    RadarFrame.Size = UDim2.new(0.9, 0, 0, 35)
+    RadarFrame.Position = UDim2.new(0.05, 0, 0, 50)
+    RadarFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+    Instance.new("UICorner", RadarFrame).CornerRadius = UDim.new(0, 6)
+    
+    local StatusText = Instance.new("TextLabel", RadarFrame)
+    StatusText.Size = UDim2.new(1, 0, 1, 0)
+    StatusText.BackgroundTransparency = 1
+    StatusText.Text = "Đang quét map..."
+    StatusText.TextColor3 = Color3.fromRGB(200, 200, 200)
+    StatusText.Font = Enum.Font.GothamMedium
+    StatusText.TextSize = 11
+
+    local Container = Instance.new("Frame", Main)
+    Container.Size = UDim2.new(1, 0, 1, -120)
+    Container.Position = UDim2.new(0, 0, 0, 95)
+    Container.BackgroundTransparency = 1
+    local Layout = Instance.new("UIListLayout", Container)
+    Layout.HorizontalAlignment = Enum.HorizontalAlignment.Center; Layout.Padding = UDim.new(0, 10)
+
+    local function CreateToggle(name, text, stateKey, callback)
+        local btn = Instance.new("TextButton", Container)
+        btn.Size = UDim2.new(0.9, 0, 0, 35)
+        local isDefaultOn = HubState.Toggles[stateKey]
+        
+        btn.BackgroundColor3 = isDefaultOn and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(35, 35, 40)
+        btn.TextColor3 = isDefaultOn and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(200, 200, 200)
+        btn.Font = Enum.Font.GothamBold
+        btn.TextSize = 12
+        btn.Text = text
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+        
+        local btnStroke = Instance.new("UIStroke", btn)
+        btnStroke.Color = isDefaultOn and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(60, 60, 70)
+        btnStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+
+        btn.MouseButton1Click:Connect(function()
+            HubState.Toggles[stateKey] = not HubState.Toggles[stateKey]
+            local isOn = HubState.Toggles[stateKey]
+            
+            TweenService:Create(btn, TweenInfo.new(0.2), {
+                BackgroundColor3 = isOn and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(35, 35, 40),
+                TextColor3 = isOn and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(200, 200, 200)
+            }):Play()
+            
+            btnStroke.Color = isOn and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(60, 60, 70)
+
+            if callback then callback(isOn) end
+        end)
+        
+        if isDefaultOn and callback then task.spawn(function() callback(true) end) end
+    end
+
+    CreateToggle("BtnFarm", "⚡ AUTO GOM FRUIT", "AutoFarm", ToggleAutoFarm)
+    CreateToggle("BtnHop", "🚀 AUTO HOP SERVER", "AutoHop", nil) 
+    CreateToggle("BtnSell", "💰 AUTO SELL GEMS", "AutoSell", ToggleAutoSell)
+    CreateToggle("BtnESP", "👁️ BẬT ESP FRUIT", "EspFruit", ToggleESP)
+    CreateToggle("BtnWater", "🌊 CHẶN NƯỚC", "AntiWater", nil) 
+
+    local Signature = Instance.new("TextLabel", Main)
+    Signature.Size = UDim2.new(1, 0, 0, 20)
+    Signature.Position = UDim2.new(0, 0, 1, -25)
+    Signature.BackgroundTransparency = 1
+    Signature.Text = "by Huynh Toann"
+    Signature.TextColor3 = Color3.fromRGB(100, 100, 100)
+    Signature.Font = Enum.Font.Gotham
+    Signature.TextSize = 11
+
+    StartRadar(StatusText)
+end
+
+BuildPremiumUI()
